@@ -1,0 +1,128 @@
+{
+  "name": "SAP RAG Teams Workflow",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "teams-sap-rag",
+        "responseMode": "onReceived",
+        "responseData": "allEntries"
+      },
+      "name": "Teams Incoming Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [200, 300]
+    },
+    {
+      "parameters": {
+        "keepOnlySet": true,
+        "values": {
+          "string": [
+            {
+              "name": "question",
+              "value": "={{ $json.body.text }}"
+            },
+            {
+              "name": "user_email",
+              "value": "={{ $json.body.from.user.email }}"
+            }
+          ]
+        }
+      },
+      "name": "Extract Question",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 2,
+      "position": [420, 300]
+    },
+    {
+      "parameters": {
+        "url": "http://FASTAPI_URL/ask",
+        "method": "POST",
+        "jsonParameters": true,
+        "options": {},
+        "bodyParametersJson": "={\"question\": \"{{$json.question}}\", \"user_email\": \"{{$json.user_email}}\"}"
+      },
+      "name": "Call FastAPI RAG",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 2,
+      "position": [660, 300]
+    },
+    {
+      "parameters": {
+        "keepOnlySet": true,
+        "values": {
+          "string": [
+            {
+              "name": "reply_text",
+              "value": "={{ $json.answer }}"
+            }
+          ]
+        }
+      },
+      "name": "Prepare Teams Reply",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 2,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "url": "https://TEAMS_WEBHOOK_URL",
+        "method": "POST",
+        "jsonParameters": true,
+        "options": {},
+        "bodyParametersJson": "={\"text\": \"{{$json.reply_text}}\"}"
+      },
+      "name": "Send Reply to Teams",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 2,
+      "position": [1140, 300]
+    }
+  ],
+  "connections": {
+    "Teams Incoming Webhook": {
+      "main": [
+        [
+          {
+            "node": "Extract Question",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Question": {
+      "main": [
+        [
+          {
+            "node": "Call FastAPI RAG",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call FastAPI RAG": {
+      "main": [
+        [
+          {
+            "node": "Prepare Teams Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Teams Reply": {
+      "main": [
+        [
+          {
+            "node": "Send Reply to Teams",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true
+}
