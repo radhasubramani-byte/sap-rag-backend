@@ -1,91 +1,79 @@
 import os
-from fastapi import FastAPI, HTTPException
+import uuid
+from fastapi import FastAPI
 from pydantic import BaseModel
 from supabase import create_client
 from openai import OpenAI
-import tiktoken
-
-# ---------------------------------------------------
-# ENVIRONMENT CHECK
-# ---------------------------------------------------
-
-required_env = [
-    "OPENAI_API_KEY",
-    "SUPABASE_URL",
-    "SUPABASE_SERVICE_KEY"
-]
-
-for key in required_env:
-    if not os.getenv(key):
-        raise RuntimeError(f"Missing environment variable: {key}")
-
-# ---------------------------------------------------
-# CLIENT INITIALIZATION
-# ---------------------------------------------------
-
-supabase = create_client(
-    os.environ["SUPABASE_URL"],
-    os.environ["SUPABASE_SERVICE_KEY"]
-)
-
-openai_client = OpenAI(
-    api_key=os.environ["OPENAI_API_KEY"]
-)
-
-# ---------------------------------------------------
-# FASTAPI APP
-# ---------------------------------------------------
 
 app = FastAPI(title="SAP RAG Backend")
 
-# ---------------------------------------------------
-# TOKENIZER FOR CHUNKING
-# ---------------------------------------------------
+# ---------- ENV ----------
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 
-tokenizer = tiktoken.get_encoding("cl100k_base")
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+openai = OpenAI(api_key=OPENAI_KEY)
 
+# ---------- MODELS ----------
+class DocumentIn(BaseModel):
+    title: str
+    content: str
+    source: str | None = None
 
-def chunk_text(text: str, max_tokens: int = 700):
-    tokens = tokenizer.encode(text)
+# ---------- HEALTH ----------
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+# ---------- CHUNK HELPER ----------
+def chunk_text(text: str, size: int = 800, overlap: int = 100):
     chunks = []
+    start = 0
 
-    for i in range(0, len(tokens), max_tokens):
-        chunk = tokenizer.decode(tokens[i:i + max_tokens])
-        chunks.append(chunk)
+    while start < len(text):
+        end = start + size
+        chunks.append(text[start:end])
+        start += size - overlap
 
     return chunks
 
-
-# ---------------------------------------------------
-# EMBEDDING HELPER
-# ---------------------------------------------------
-
+# ---------- EMBEDDING ----------
 def embed_text(text: str):
-    response = openai_client.embeddings.create(
+    response = openai.embeddings.create(
         model="text-embedding-3-small",
         input=text
     )
     return response.data[0].embedding
 
+# ---------- INGEST ----------
+@app.post("/ingest")
+async def ingest_document(doc: DocumentIn):
 
-# ---------------------------------------------------
-# REQUEST MODEL
-# ---------------------------------------------------
+    # insert document metadata
+    doc_id = str(uuid.uuid4())
 
-class IngestRequest(BaseModel):
-    title: str
-    content: str
-    source: str
+    supabase.table("documents").insert({
+        "id": doc_id,
+        "title": doc.title,
+        "content": doc.content,
+        "source": doc.source
+    }).execute()
 
+    # chunk + embed
+    chunks = chunk_text(doc.content)
 
-# ---------------------------------------------------
-# HEALTH CHECK
-# ---------------------------------------------------
+    for chunk in chunks:
+        embedding = embed_text(chunk)
 
-@app.get("/")
-def health():
-    return {"status": "SAP RAG backend running"}
+        supabase.table("document_embeddings").insert({
+            "document_id": doc_id,
+            "chunk": chunk,
+            "embedding": embedding
+        }).execute()
 
-
-# ---------------------------------------------------
-#
+    return {
+        "status": "success",
+        "chunks": len(chunks),
+        "document_id": doc_id
+    }
