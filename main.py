@@ -1,104 +1,110 @@
 import os
 import math
-from fastapi import FastAPI, HTTPException
+import ast
+from typing import List
+
+from fastapi import FastAPI
 from pydantic import BaseModel
 from supabase import create_client
 from openai import OpenAI
 
-# ---------------------------------------------------
+# =============================
 # Environment setup
-# ---------------------------------------------------
+# =============================
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not all([SUPABASE_URL, SUPABASE_SERVICE_KEY, OPENAI_API_KEY]):
-    raise RuntimeError("Missing environment variables")
+    raise Exception("Missing environment variables")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+openai = OpenAI(api_key=OPENAI_API_KEY)
 
-# ---------------------------------------------------
+# =============================
 # FastAPI app
-# ---------------------------------------------------
+# =============================
 
 app = FastAPI(title="SAP RAG Backend")
 
-# ---------------------------------------------------
+# =============================
 # Models
-# ---------------------------------------------------
-
-class AskRequest(BaseModel):
-    question: str
-    user_email: str | None = None
-
+# =============================
 
 class DocumentIn(BaseModel):
     title: str
     content: str
-    source: str | None = None
+    source: str
 
-# ---------------------------------------------------
+class QuestionIn(BaseModel):
+    question: str
+    user_email: str | None = None
+
+# =============================
 # Helpers
-# ---------------------------------------------------
+# =============================
 
-def chunk_text(text: str, chunk_size: int = 500, overlap: int = 50):
+def chunk_text(text: str, size: int = 500) -> List[str]:
     words = text.split()
     chunks = []
+    current = []
 
-    i = 0
-    while i < len(words):
-        chunk = words[i:i + chunk_size]
-        chunks.append(" ".join(chunk))
-        i += chunk_size - overlap
+    for word in words:
+        current.append(word)
+        if len(current) >= size:
+            chunks.append(" ".join(current))
+            current = []
+
+    if current:
+        chunks.append(" ".join(current))
 
     return chunks
 
 
-def embed_text(text: str):
-    response = openai_client.embeddings.create(
+def embed_text(text: str) -> List[float]:
+    emb = openai.embeddings.create(
         model="text-embedding-3-small",
         input=text
     )
-    return response.data[0].embedding
+    return emb.data[0].embedding
 
 
-def cosine_similarity(a, b):
+def cosine_similarity(a: List[float], b: List[float]) -> float:
     dot = sum(x * y for x, y in zip(a, b))
     norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(x * x for x in b))
-    return dot / (norm_a * norm_b)
+    norm_b = math.sqrt(sum(y * y for y in b))
+    return dot / (norm_a * norm_b + 1e-9)
 
 
-# ---------------------------------------------------
+# =============================
 # Health endpoint
-# ---------------------------------------------------
+# =============================
 
 @app.get("/health")
-def health():
+async def health():
     return {"status": "ok"}
 
-# ---------------------------------------------------
+
+# =============================
 # Ingestion endpoint
-# ---------------------------------------------------
+# =============================
 
 @app.post("/ingest")
 async def ingest_document(doc: DocumentIn):
     try:
-        # Save document
-        doc_result = supabase.table("documents").insert({
+        # store document
+        doc_insert = supabase.table("documents").insert({
             "title": doc.title,
             "content": doc.content,
             "source": doc.source
         }).execute()
 
-        document_id = doc_result.data[0]["id"]
+        document_id = doc_insert.data[0]["id"]
 
-        # Chunk text
+        # chunk + embed
         chunks = chunk_text(doc.content)
 
-        # Embed + store
         for chunk in chunks:
             embedding = embed_text(chunk)
 
@@ -115,55 +121,71 @@ async def ingest_document(doc: DocumentIn):
         }
 
     except Exception as e:
-        print("INGEST ERROR:", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"error": str(e)}
 
 
-# ---------------------------------------------------
-# Ask endpoint (RAG retrieval)
-# ---------------------------------------------------
+# =============================
+# RAG Ask endpoint
+# =============================
 
 @app.post("/ask")
-async def ask_rag(req: AskRequest):
+async def ask_rag(q: QuestionIn):
     try:
-        question_embedding = embed_text(req.question)
+        # embed question
+        query_embedding = embed_text(q.question)
 
-        embeddings_data = supabase.table("document_embeddings") \
-            .select("*") \
-            .limit(200) \
-            .execute()
+        rows = supabase.table("document_embeddings").select("*").execute().data
 
-        scored_chunks = []
+        if not rows:
+            return {
+                "answer": "No knowledge found.",
+                "confidence": "low"
+            }
 
-        for row in embeddings_data.data:
-            score = cosine_similarity(question_embedding, row["embedding"])
-            scored_chunks.append((score, row["chunk"]))
+        best_score = -1
+        best_chunk = ""
 
-        scored_chunks.sort(reverse=True, key=lambda x: x[0])
-        top_context = "\n\n".join(chunk for _, chunk in scored_chunks[:5])
+        for row in rows:
+            vec = row["embedding"]
 
-        prompt = f"""
-Use the context below to answer the question.
+            # 🔥 SAFE VECTOR PARSE
+            if isinstance(vec, str):
+                vec = ast.literal_eval(vec)
 
-Context:
-{top_context}
+            score = cosine_similarity(query_embedding, vec)
 
-Question:
-{req.question}
-"""
+            if score > best_score:
+                best_score = score
+                best_chunk = row["chunk"]
 
-        completion = openai_client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=[{"role": "user", "content": prompt}],
+        # LLM answer
+        completion = openai.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are an SAP assistant. Answer using provided context."
+                },
+                {
+                    "role": "user",
+                    "content": f"Context:\n{best_chunk}\n\nQuestion:\n{q.question}"
+                }
+            ]
         )
 
         answer = completion.choices[0].message.content
 
+        confidence = (
+            "high" if best_score > 0.85
+            else "medium" if best_score > 0.65
+            else "low"
+        )
+
         return {
             "answer": answer,
-            "confidence": "medium"
+            "confidence": confidence,
+            "similarity": round(best_score, 3)
         }
 
     except Exception as e:
-        print("ASK ERROR:", e)
-        raise HTTPException(status_code=500, detail=str(e))
+        return {"detail": str(e)}
